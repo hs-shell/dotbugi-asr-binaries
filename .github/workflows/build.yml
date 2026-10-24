@@ -138,7 +138,11 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name != 'pull_request'
+    # 수동 실행은 main 에서만, push 는 asr-v* 태그만 릴리즈한다 (PR·다른 브랜치는 건너뜀)
+    if: >-
+      github.event_name != 'pull_request' &&
+      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/asr-v')))
     needs: [linux-x64, macos-arm64]
     runs-on: ubuntu-latest
     permissions:
@@ -160,7 +164,11 @@ jobs:
           # 입력값은 스크립트에 직접 넣지 않고 환경변수로만 받는다 (명령 주입 방지)
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          [[ "$TAG" =~ ^asr-v[0-9]+$ ]] || { echo "태그 형식은 asr-v<숫자> 입니다: $TAG"; exit 1; }
+          # 검증 전 값은 로그에 찍지 않는다 (워크플로 명령·로그 주입 방지)
+          [[ "$TAG" =~ ^asr-v[0-9]+$ ]] || { echo '태그 형식은 asr-v<숫자> 여야 합니다'; exit 1; }
+          # 이미 있는 태그가 다른 커밋을 가리키면 그 태그 이름으로 다른 바이너리를 올리지 않는다 (annotated 는 ^{} 로 벗긴 커밋)
+          TAG_SHA=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | awk '{print $1}' | tail -n 1)
+          if [[ -n "$TAG_SHA" && "$TAG_SHA" != "$GITHUB_SHA" ]]; then echo "태그 $TAG 가 이미 다른 커밋을 가리킵니다"; exit 1; fi
           # 바이너리에 포함된 qwen-asr(MIT)·linux 에 정적 링크된 OpenBLAS(BSD-3) 고지를 함께 배포한다
           cp licenses/qwen-asr-LICENSE licenses/OpenBLAS-LICENSE .
           sha256sum qwen_asr-* > SHA256SUMS
