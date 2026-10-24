@@ -11,6 +11,8 @@ on:
   push:
     tags:
       - 'asr-v*'
+  # PR 에서는 빌드·스모크 테스트만 (release 잡은 건너뛴다)
+  pull_request:
 
 permissions:
   contents: read
@@ -21,7 +23,6 @@ env:
   COMMON_CFLAGS: -Wall -O3 -ffast-math -fno-finite-math-only -DUSE_BLAS
 
 jobs:
-  # macOS(arm64, Accelerate) 빌드는 실행 검증 전까지 두지 않는다
   linux-x64:
     # 빌드한 glibc(2.35) 이상에서만 실행된다 — 오래된 러너일수록 더 많은 배포판을 지원
     runs-on: ubuntu-22.04
@@ -65,8 +66,80 @@ jobs:
           path: qwen_asr-linux-x64
           if-no-files-found: error
 
+  macos-arm64:
+    runs-on: macos-14
+    env:
+      # ACCELERATE_NEW_LAPACK 의 cblas 는 macOS 13.3 부터 있다
+      MACOSX_DEPLOYMENT_TARGET: '13.3'
+      # dotbugi-mcp src/asr/pins.ts 와 같은 고정값 — 스모크 테스트를 실제 설치와 같은 파일로 돌린다
+      FFMPEG_WHEEL_URL: https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8feda487317da5b5d31c0e1fdfd5e986e55d17/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl
+      FFMPEG_WHEEL_SHA256: b1ae3173414b5fc5f538a726c4e48ea97edc0d2cdc11f103afee655c463fa742
+      FFMPEG_ENTRY: imageio_ffmpeg/binaries/ffmpeg-macos-aarch64-v7.1
+      FFMPEG_ENTRY_SHA256: 6d175a4743ca50256e89a8cdd731100f9cee33bd79aeea46894d209410dc6617
+      MODEL_REPO: Qwen/Qwen3-ASR-0.6B
+      MODEL_REVISION: 5eb144179a02acc5e5ba31e748d22b0cf3e303b0
+    steps:
+      - name: qwen-asr 체크아웃 (커밋 고정)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: antirez/qwen-asr
+          ref: ${{ env.QWEN_ASR_COMMIT }}
+          path: qwen-asr
+          persist-credentials: false
+
+      - name: qwen_asr 빌드 (Accelerate)
+        working-directory: qwen-asr
+        run: |
+          test "$(git rev-parse HEAD)" = "$QWEN_ASR_COMMIT"
+          # -march=native 대신 -mcpu=apple-m1 — 커널은 NEON 기본 기능만 써서 모든 Apple Silicon 에서 돈다
+          make qwen_asr CC=clang \
+            CFLAGS="$COMMON_CFLAGS -mcpu=apple-m1 -DACCELERATE_NEW_LAPACK" \
+            LDFLAGS="-framework Accelerate -lm -lpthread"
+          lipo -archs qwen_asr | grep -qx arm64
+          otool -l qwen_asr | grep -A3 LC_BUILD_VERSION
+          otool -L qwen_asr
+          # 동적 의존은 시스템 라이브러리·프레임워크뿐이어야 한다
+          if otool -L qwen_asr | tail -n +2 | grep -vE '^[[:space:]]+(/usr/lib/|/System/Library/)'; then echo '시스템 밖 동적 의존이 있습니다'; exit 1; fi
+          mv qwen_asr "$GITHUB_WORKSPACE/qwen_asr-macos-arm64"
+
+      - name: 스모크 테스트 (고정 ffmpeg·0.6B 모델·한국어 TTS)
+        run: |
+          mkdir smoke && cd smoke
+          curl -fsSLo ffmpeg.whl "$FFMPEG_WHEEL_URL"
+          echo "${FFMPEG_WHEEL_SHA256}  ffmpeg.whl" | shasum -a 256 -c -
+          unzip -p ffmpeg.whl "$FFMPEG_ENTRY" > ffmpeg
+          echo "${FFMPEG_ENTRY_SHA256}  ffmpeg" | shasum -a 256 -c -
+          chmod +x ffmpeg
+          mkdir model
+          while read -r sha file; do
+            curl -fsSLo "model/$file" "https://huggingface.co/${MODEL_REPO}/resolve/${MODEL_REVISION}/${file}"
+            echo "${sha}  model/${file}" | shasum -a 256 -c -
+          done <<'PINS'
+          75a8cfca24f00de72d796fbfed6858fc9614ef3dabd8696684cc3bc03a9c58ff chat_template.json
+          1da527824d81e07118facff437e03f2e24a23311e3bdeb2368973fe77e5f275c generation_config.json
+          8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5 merges.txt
+          45e120a4eda2c20c5d7f2ea9354e63536bf35e27aa573fb7cdf78017b378770d preprocessor_config.json
+          4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c tokenizer_config.json
+          ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910 vocab.json
+          76d3ae4601ce939830b2517f4a6cadb86cc51316c3900af6b020b051c21a478c config.json
+          79d6cbd4c98c7bbffe9db2edac07f56cd6637d0d5944b27f6c2b8353840323ea model.safetensors
+          PINS
+          say -v Yuna -o speech.aiff '안녕하세요. 한성대학교 강의입니다. 오늘은 운영체제 수업을 시작하겠습니다.'
+          # dotbugi-mcp 와 같은 방식: ffmpeg 가 16kHz mono s16le 를 stdin 으로, 같은 인자로 실행
+          ./ffmpeg -nostdin -hide_banner -loglevel error -i speech.aiff -vn -ac 1 -ar 16000 -f s16le pipe:1 \
+            | "$GITHUB_WORKSPACE/qwen_asr-macos-arm64" -d model --stdin --language Korean -S 30 -t 3 --silent > out.txt
+          cat out.txt
+          python3 -I -c 'import re,sys; t=open(sys.argv[1],encoding="utf-8").read(); sys.exit(0 if re.search("[가-힣]{2,}", t) else "한국어 출력이 없습니다")' out.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qwen_asr-macos-arm64
+          path: qwen_asr-macos-arm64
+          if-no-files-found: error
+
   release:
-    needs: [linux-x64]
+    if: github.event_name != 'pull_request'
+    needs: [linux-x64, macos-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -88,11 +161,11 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           [[ "$TAG" =~ ^asr-v[0-9]+$ ]] || { echo "태그 형식은 asr-v<숫자> 입니다: $TAG"; exit 1; }
-          # 바이너리에 정적 링크된 OpenBLAS(BSD-3)·qwen-asr(MIT) 고지를 함께 배포한다
+          # 바이너리에 포함된 qwen-asr(MIT)·linux 에 정적 링크된 OpenBLAS(BSD-3) 고지를 함께 배포한다
           cp licenses/qwen-asr-LICENSE licenses/OpenBLAS-LICENSE .
           sha256sum qwen_asr-* > SHA256SUMS
           cat SHA256SUMS
           gh release create "$TAG" qwen_asr-* SHA256SUMS qwen-asr-LICENSE OpenBLAS-LICENSE \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "$TAG (qwen-asr ${QWEN_ASR_COMMIT:0:7})" \
-            --notes "antirez/qwen-asr@${QWEN_ASR_COMMIT} + OpenBLAS 0.3.34 (정적). 검증: sha256sum -c SHA256SUMS"
+            --notes "antirez/qwen-asr@${QWEN_ASR_COMMIT} — linux-x64: OpenBLAS 0.3.34 (정적), macos-arm64: Accelerate (macOS 13.3+). 검증: sha256sum -c SHA256SUMS"
